@@ -12,6 +12,7 @@ import type {
 import {
   acquireSessionRoute,
   releaseSessionRoute,
+  stopSessionRoute,
   type SessionRoute
 } from './structured-agent-session-acquisition-route'
 
@@ -180,6 +181,14 @@ export class StructuredAgentSessionAdapterRouter implements StructuredAgentSessi
     return reader(input)
   }
 
+  generateText: NonNullable<StructuredAgentSessionAdapter['generateText']> = (input) => {
+    const { adapter } = this.requireAgent(input)
+    if (!adapter.generateText) {
+      return Promise.reject(new Error(`${input.agent} cannot run an independent text task`))
+    }
+    return adapter.generateText(input)
+  }
+
   copyConversation: NonNullable<StructuredAgentSessionAdapter['copyConversation']> = (input) => {
     const { adapter } = this.requireAgent(input.identity)
     if (!adapter.copyConversation) {
@@ -215,25 +224,16 @@ export class StructuredAgentSessionAdapterRouter implements StructuredAgentSessi
       // Missing routes prove no stop; claiming success would incorrectly release a durable lease.
       return false
     }
-    if (route.state === 'stopped') {
-      return true
-    }
     if (route.state === 'acquiring') {
       return this.releaseAcquisition({ sessionId })
     }
-    const { adapter } = route.registration
-    const stopped = await stop(adapter)
-    if (stopped === true) {
-      route.state = 'stopped'
-      return true
-    }
-    return false
+    return stopSessionRoute(route, () => stop(route.registration.adapter))
   }
 
   hasOwnedAcquisition = (sessionId: string): boolean => {
     const route = this.routes.get(sessionId)
     return (
-      (route?.state === 'stopped' && !!route.acquisition) ||
+      ((route?.state === 'stopped' || route?.state === 'kill-delivered') && !!route.acquisition) ||
       route?.registration.adapter.hasOwnedAcquisition?.(sessionId) === true
     )
   }
@@ -242,7 +242,9 @@ export class StructuredAgentSessionAdapterRouter implements StructuredAgentSessi
     sessionId: string
   ): StructuredAgentSessionAcquisitionReceipt | undefined => {
     const route = this.routes.get(sessionId)
-    return route?.state === 'stopped' ? route.acquisition : undefined
+    return route?.state === 'stopped' || route?.state === 'kill-delivered'
+      ? route.acquisition
+      : undefined
   }
 
   async closeAll(): Promise<void> {
@@ -301,7 +303,9 @@ export class StructuredAgentSessionAdapterRouter implements StructuredAgentSessi
     return route?.state === 'live' ? route.registration.adapter : null
   }
 
-  private requireAgent(identity: AgentSessionJournalIdentity): StructuredAgentRegistration {
+  private requireAgent(
+    identity: Pick<AgentSessionJournalIdentity, 'agent'>
+  ): StructuredAgentRegistration {
     const registration = this.agents.registration(identity.agent)
     if (!registration) {
       throw new Error(`structured sessions do not support ${identity.agent}`)
